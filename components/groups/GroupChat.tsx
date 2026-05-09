@@ -50,8 +50,12 @@ export default function GroupChat({ groupId, initialMessages, currentUserId, mem
   const [detectedPlan, setDetectedPlan] = useState<DetectedPlan | null>(null);
   const [confirming, setConfirming] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
+  const messagesRef = useRef<Message[]>(messages);
   const detectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const lastDetectRef = useRef<number>(0);
+
+  useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
 
   useEffect(() => {
     const supabase = createClient();
@@ -88,15 +92,10 @@ export default function GroupChat({ groupId, initialMessages, currentUserId, mem
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
-  const runDetection = useCallback(async (currentMessages: Message[]) => {
-    // Throttle: don't call more than once every 2 minutes
-    const now = Date.now();
-    if (now - lastDetectRef.current < 2 * 60 * 1000) return;
-
+  const runDetection = useCallback(async () => {
+    const currentMessages = messagesRef.current;
     const recent = currentMessages.filter(m => !m.is_system).slice(-30);
     if (!recent.some(m => TIME_KEYWORDS.test(m.content))) return;
-
-    lastDetectRef.current = now;
 
     const payload = recent.map(m => ({
       content: m.content,
@@ -143,12 +142,12 @@ export default function GroupChat({ groupId, initialMessages, currentUserId, mem
     }
     setSending(false);
 
-    // Debounce detection — wait 4s after the last message before analysing
+    // Debounce detection — wait 3s after the last message before analysing
     if (detectTimeoutRef.current) clearTimeout(detectTimeoutRef.current);
     if (TIME_KEYWORDS.test(text)) {
       detectTimeoutRef.current = setTimeout(() => {
-        setMessages(current => { runDetection(current); return current; });
-      }, 4000);
+        runDetection();
+      }, 3000);
     }
   }
 
