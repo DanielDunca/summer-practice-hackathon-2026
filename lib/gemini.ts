@@ -1,4 +1,4 @@
-const GEMINI_MODEL = "gemini-2.5-flash";
+export const GEMINI_MODEL = "gemini-3.1-flash-lite";
 
 export async function generateText(prompt: string): Promise<string> {
   const key = process.env.GEMINI_API_KEY;
