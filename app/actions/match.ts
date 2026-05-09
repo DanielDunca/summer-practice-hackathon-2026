@@ -7,8 +7,10 @@ import { revalidatePath } from "next/cache";
 import { checkAndAwardAchievements, sendNotification } from "@/app/actions/events";
 
 export interface MatchResult {
-  groupId: string;
+  previewId: string;
+  groupId?: string;
   sport: string;
+  sportId: string;
   sportIcon: string;
   memberCount: number;
   captainName: string;
@@ -17,6 +19,7 @@ export interface MatchResult {
     userId: string;
     fullName: string;
     avatarUrl: string | null;
+    isCurrentUser: boolean;
     status: "pending" | "confirmed" | "declined";
   }>;
 }
@@ -35,6 +38,8 @@ type GroupMemberRow = {
   user_id: string;
   status: "pending" | "confirmed" | "declined";
 };
+
+type PreviewMember = MatchResult["members"][number];
 
 function distanceKm(aLat: number, aLng: number, bLat: number, bLng: number) {
   const toRad = (value: number) => value * Math.PI / 180;
@@ -69,7 +74,48 @@ function selectCaptain(players: MatchProfile[]) {
   })[0] ?? players[0];
 }
 
-async function loadMemberPreview(admin: ReturnType<typeof createAdminClient>, groupId: string) {
+function normalizeLocation(value: string | null | undefined) {
+  return (value ?? "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim()
+    .replace(/\s+/g, " ");
+}
+
+function levenshtein(a: string, b: string) {
+  const rows = a.length + 1;
+  const cols = b.length + 1;
+  const matrix: number[][] = Array.from({ length: rows }, () => Array(cols).fill(0));
+  for (let i = 0; i < rows; i++) matrix[i][0] = i;
+  for (let j = 0; j < cols; j++) matrix[0][j] = j;
+  for (let i = 1; i < rows; i++) {
+    for (let j = 1; j < cols; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      matrix[i][j] = Math.min(
+        matrix[i - 1][j] + 1,
+        matrix[i][j - 1] + 1,
+        matrix[i - 1][j - 1] + cost
+      );
+    }
+  }
+  return matrix[rows - 1][cols - 1];
+}
+
+function locationsMatch(a: string | null | undefined, b: string | null | undefined) {
+  const left = normalizeLocation(a);
+  const right = normalizeLocation(b);
+  if (!left || !right) return false;
+  if (left === right) return true;
+  if (left.includes(right) || right.includes(left)) return true;
+
+  const maxLen = Math.max(left.length, right.length);
+  const distance = levenshtein(left, right);
+  return distance <= 2 || distance <= Math.ceil(maxLen * 0.2);
+}
+
+async function loadMemberPreview(admin: ReturnType<typeof createAdminClient>, groupId: string, currentUserId: string) {
   const { data: members } = await admin
     .from("group_members")
     .select("user_id, status")
@@ -95,9 +141,143 @@ async function loadMemberPreview(admin: ReturnType<typeof createAdminClient>, gr
       userId: member.user_id,
       fullName: profile?.full_name ?? "Player",
       avatarUrl: profile?.avatar_url ?? null,
+      isCurrentUser: member.user_id === currentUserId,
       status: member.status,
     };
   });
+}
+
+async function getNearbyUserIds(admin: ReturnType<typeof createAdminClient>, myLat: number | null, myLng: number | null, myCity: string | null) {
+  if (myLat !== null && myLng !== null) {
+    const { data } = await (admin as any).rpc("nearby_users", { lat: myLat, lng: myLng, radius_km: 25 });
+    return ((data ?? []) as any[]).map(row => row.user_id as string);
+  }
+
+  const { data: profiles } = await admin
+    .from("profiles")
+    .select("user_id, location_name");
+
+  return ((profiles ?? []) as any[])
+    .filter(profile => locationsMatch(profile.location_name ?? null, myCity))
+    .map(profile => profile.user_id as string);
+}
+
+async function buildMemberPreview(admin: ReturnType<typeof createAdminClient>, groupId: string, currentUserId: string) {
+  const { data: groupMembers } = await admin
+    .from("group_members")
+    .select("user_id, status")
+    .eq("group_id", groupId)
+    .neq("status", "declined");
+
+  const memberRows = (groupMembers ?? []) as GroupMemberRow[];
+  const memberIds = memberRows.map(member => member.user_id);
+  const { data: profiles } = memberIds.length > 0
+    ? await admin
+      .from("profiles")
+      .select("user_id, full_name, avatar_url")
+      .in("user_id", memberIds)
+    : { data: [] };
+
+  const profileMap = new Map<string, { full_name: string; avatar_url: string | null }>(
+    ((profiles ?? []) as any[]).map(profile => [profile.user_id, { full_name: profile.full_name, avatar_url: profile.avatar_url }])
+  );
+
+  return memberRows.map(member => {
+    const profile = profileMap.get(member.user_id);
+    const preview: PreviewMember = {
+      userId: member.user_id,
+      fullName: profile?.full_name ?? "Player",
+      avatarUrl: profile?.avatar_url ?? null,
+      isCurrentUser: member.user_id === currentUserId,
+      status: member.status,
+    };
+    return preview;
+  });
+}
+
+export async function createGroupFromPreview(sportId: string, memberIds: string[]) {
+  const supabase = await createClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) return { error: "Not authenticated" };
+
+  const admin = createAdminClient();
+  const today = new Date().toISOString().split("T")[0];
+
+  return createGroupFromPreviewInternal(admin, sportId, memberIds, user.id, today);
+}
+
+async function createGroupFromPreviewInternal(admin: ReturnType<typeof createAdminClient>, sportId: string, memberIds: string[], currentUserId: string, today: string) {
+  const { data: sport } = await admin
+    .from("sports")
+    .select("id, name, icon, min_players, max_players")
+    .eq("id", sportId)
+    .single();
+
+  if (!sport) return { error: "Sport not found" };
+
+  const { data: profiles } = await admin
+    .from("profiles")
+    .select("user_id, full_name, bio, avatar_url, skill_level, location_lat, location_lng")
+    .in("user_id", memberIds);
+
+  const sorted = (profiles ?? []) as MatchProfile[];
+  if (sorted.length === 0) return { error: "No members available" };
+
+  const captain = selectCaptain(sorted);
+  const { data: group, error: groupError } = await admin
+    .from("groups")
+    .insert({
+      sport_id: (sport as any).id,
+      captain_id: captain.user_id,
+      status: "forming",
+      event_date: today,
+    })
+    .select("id")
+    .single();
+
+  if (groupError || !group) return { error: groupError?.message ?? "Could not create group" };
+
+  const { error: memberInsertError } = await admin.from("group_members").insert(
+    memberIds.map(userId => ({
+      group_id: (group as any).id,
+      user_id: userId,
+      status: userId === currentUserId ? "confirmed" : "pending",
+    }))
+  );
+
+  if (memberInsertError) {
+    await admin.from("groups").delete().eq("id", (group as any).id);
+    return { error: memberInsertError.message };
+  }
+
+  const memberNames = sorted.map(p => (p.full_name ?? "Player").split(" ")[0]).join(", ");
+  const welcomeMsg = await generateText(
+    `You are a friendly coordinator for ShowUp2Move, a sports matching app. A new ${(sport as any).name} group just formed with ${sorted.length} players: ${memberNames}. Write a short, energetic welcome message (2 sentences max) to kick off their group chat. Be warm and enthusiastic. No hashtags, no emoji spam — just natural energy.`
+  ) ?? `Welcome to the ${(sport as any).name} group, ${memberNames}. Use this chat to confirm time, place, and anything you need before you play.`;
+
+  await admin.from("messages").insert({
+    group_id: (group as any).id,
+    user_id: currentUserId,
+    content: welcomeMsg,
+  });
+
+  for (const memberId of memberIds) {
+    await sendNotification(
+      memberId,
+      "matched",
+      `You're in a ${(sport as any).name} group!`,
+      "Open the group to review the members and confirm your spot.",
+      `/groups/${(group as any).id}`
+    );
+  }
+
+  await checkAndAwardAchievements(captain.user_id);
+
+  return { groupId: (group as any).id, sportName: (sport as any).name, sportIcon: (sport as any).icon };
+}
+
+async function getMatchableUserIds(admin: ReturnType<typeof createAdminClient>, myLat: number | null, myLng: number | null, myCity: string | null) {
+  return getNearbyUserIds(admin, myLat, myLng, myCity);
 }
 
 export async function runMatching(sportIds: string[]): Promise<{ matched: MatchResult[]; error?: string }> {
@@ -118,7 +298,7 @@ export async function runMatching(sportIds: string[]): Promise<{ matched: MatchR
   const locationName = (myProfile as any)?.location_name ?? null;
   const myLat = (myProfile as any)?.location_lat ?? null;
   const myLng = (myProfile as any)?.location_lng ?? null;
-  const myCity = locationName?.toLowerCase().trim() ?? null;
+  const myCity = normalizeLocation(locationName) || null;
 
   // Refuse to match without any location data at all
   if (myLat === null && myCity === null) {
@@ -126,8 +306,7 @@ export async function runMatching(sportIds: string[]): Promise<{ matched: MatchR
   }
 
   function sameCity(otherLocationName: string | null): boolean {
-    if (!myCity || !otherLocationName) return false;
-    return otherLocationName.toLowerCase().trim() === myCity;
+    return locationsMatch(otherLocationName, locationName);
   }
 
   function nearEnough(otherLat: number | null, otherLng: number | null, otherLocationName: string | null): boolean {
@@ -184,10 +363,12 @@ export async function runMatching(sportIds: string[]): Promise<{ matched: MatchR
         .eq("user_id", (existingAny.groups as any).captain_id)
         .maybeSingle();
 
-      const members = await loadMemberPreview(admin, existingAny.group_id);
+      const members = await buildMemberPreview(admin, existingAny.group_id, user.id);
 
       results.push({
+        previewId: crypto.randomUUID(),
         groupId: existingAny.group_id,
+        sportId: sportId,
         sport: (sport as any).name,
         sportIcon: (sport as any).icon,
         memberCount: (activeMembers ?? []).length,
@@ -198,17 +379,9 @@ export async function runMatching(sportIds: string[]): Promise<{ matched: MatchR
       continue;
     }
 
-    // If a matching group already exists, add this user to that chat instead of
-    // waiting for someone to click a separate "find matches" action.
-    // Compute nearbyIds for the open-group join check (same logic as below)
-    let nearbyIdsForJoin: string[];
-    if (myLat !== null && myLng !== null) {
-      const { data: nd } = await (admin as any).rpc("nearby_users", { lat: myLat, lng: myLng, radius_km: 25 });
-      nearbyIdsForJoin = ((nd ?? []) as any[]).map(r => r.user_id as string);
-    } else {
-      const { data: sp } = await admin.from("profiles").select("user_id").ilike("location_name", myCity!);
-      nearbyIdsForJoin = ((sp ?? []) as any[]).map(r => r.user_id as string);
-    }
+    // Preview existing open groups near the user, but do not create membership
+    // here. Joining happens only when the user explicitly accepts.
+    const nearbyIdsForJoin = await getMatchableUserIds(admin, myLat, myLng, myCity);
     if (!nearbyIdsForJoin.includes(user.id)) nearbyIdsForJoin.push(user.id);
 
     const { data: openGroups } = nearbyIdsForJoin.length > 0
@@ -247,24 +420,16 @@ export async function runMatching(sportIds: string[]): Promise<{ matched: MatchR
       const captainCity = (captainProfile as any)?.location_name ?? null;
       if (!nearEnough(captainLat, captainLng, captainCity)) continue;
 
-      const { error: addError } = await admin
-        .from("group_members")
-        .insert({
-          group_id: openGroup.id,
-          user_id: user.id,
-          status: "pending",
-        });
-
-      if (addError) continue;
-
       results.push({
+        previewId: crypto.randomUUID(),
         groupId: openGroup.id,
+        sportId: sportId,
         sport: (sport as any).name,
         sportIcon: (sport as any).icon,
         memberCount: activeMembers.length + 1,
         captainName: (captainProfile as any)?.full_name ?? "Captain",
         currentUserStatus: "pending",
-        members: await loadMemberPreview(admin, openGroup.id),
+        members: await buildMemberPreview(admin, openGroup.id, user.id),
       });
       joinedExistingGroup = true;
       break;
@@ -276,21 +441,7 @@ export async function runMatching(sportIds: string[]): Promise<{ matched: MatchR
     // This prevents any application-level edge-case from leaking cross-city
     // users into the pool. Use PostGIS when coords are available; fall back
     // to an exact case-insensitive city name query otherwise.
-    let nearbyIds: string[];
-
-    if (myLat !== null && myLng !== null) {
-      const { data: nearbyData } = await (admin as any).rpc("nearby_users", {
-        lat: myLat, lng: myLng, radius_km: 25,
-      });
-      nearbyIds = ((nearbyData ?? []) as any[]).map(r => r.user_id as string);
-    } else {
-      // myCity is guaranteed non-null here (early-return guard above)
-      const { data: sameCityProfiles } = await admin
-        .from("profiles")
-        .select("user_id")
-        .ilike("location_name", myCity!);
-      nearbyIds = ((sameCityProfiles ?? []) as any[]).map(r => r.user_id as string);
-    }
+    const nearbyIds = await getMatchableUserIds(admin, myLat, myLng, myCity);
 
     // Always include the current user in the pool
     if (!nearbyIds.includes(user.id)) nearbyIds.push(user.id);
@@ -351,68 +502,22 @@ export async function runMatching(sportIds: string[]): Promise<{ matched: MatchR
     const confirmedCount = sorted.filter(player => player.user_id === user.id).length;
 
     // Create the group
-    const { data: group, error: groupError } = await admin
-      .from("groups")
-      .insert({
-        sport_id: (sport as any).id,
-        captain_id: captain.user_id,
-        status: confirmedCount >= minPlayers ? "confirmed" : "forming",
-        event_date: today,
-      })
-      .select("id")
-      .single();
-
-    if (groupError || !group) continue;
-
-    // Add members
-    const { error: memberInsertError } = await admin.from("group_members").insert(
-      sorted.map((p: MatchProfile) => ({
-        group_id: (group as any).id,
-        user_id: p.user_id,
-        status: "pending",
-      }))
-    );
-
-    if (memberInsertError) {
-      await admin.from("groups").delete().eq("id", (group as any).id);
-      continue;
-    }
-
-    // Ask Gemini to write a welcome message
-    const memberNames = sorted.map((p: any) => (p.full_name ?? "Player").split(" ")[0]).join(", ");
-    const welcomeMsg = await generateText(
-      `You are a friendly coordinator for ShowUp2Move, a sports matching app. A new ${(sport as any).name} group just formed in ${locationName ?? "your city"} with ${sorted.length} players: ${memberNames}. Write a short, energetic welcome message (2 sentences max) to kick off their group chat. Be warm and enthusiastic. No hashtags, no emoji spam — just natural energy.`
-    ) ?? `Welcome to the ${(sport as any).name} group, ${memberNames}. Use this chat to confirm time, place, and anything you need before you play.`;
-
-    await admin.from("messages").insert({
-      group_id: (group as any).id,
-      user_id: captain.user_id,
-      content: welcomeMsg,
-      is_system: true,
-    });
-
     results.push({
-      groupId: (group as any).id,
+      previewId: crypto.randomUUID(),
+      sportId: sportId,
       sport: (sport as any).name,
       sportIcon: (sport as any).icon,
       memberCount: sorted.length,
       captainName: captain.full_name ?? "Captain",
       currentUserStatus: "pending",
-      members: await loadMemberPreview(admin, (group as any).id),
+      members: sorted.map((p: MatchProfile) => ({
+        userId: p.user_id,
+        fullName: p.full_name ?? "Player",
+        avatarUrl: p.avatar_url,
+        isCurrentUser: p.user_id === user.id,
+        status: "pending" as const,
+      })),
     });
-
-    // Notify all matched members
-    for (const p of sorted) {
-      await sendNotification(
-        p.user_id,
-        "matched",
-        `You've been matched for ${(sport as any).name}!`,
-        "Accept the invite to join the group chat.",
-        `/groups/${(group as any).id}`
-      );
-    }
-    // Award captain achievement
-    await checkAndAwardAchievements(captain.user_id);
   }
 
   revalidatePath("/groups");
@@ -463,6 +568,60 @@ export async function respondToGroupInvite(groupId: string, response: "confirmed
   revalidatePath(`/groups/${groupId}`);
   revalidatePath("/home");
   return { ok: true };
+}
+
+export async function joinExistingGroup(groupId: string) {
+  const supabase = await createClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) return { error: "Not authenticated" };
+
+  const admin = createAdminClient();
+  const { data: group } = await admin
+    .from("groups")
+    .select("id, status, event_date, sports(min_players, max_players)")
+    .eq("id", groupId)
+    .maybeSingle();
+
+  if (!group) return { error: "Group not found" };
+
+  const { data: existing } = await admin
+    .from("group_members")
+    .select("status")
+    .eq("group_id", groupId)
+    .eq("user_id", user.id)
+    .maybeSingle();
+
+  if (existing?.status === "confirmed") {
+    revalidatePath("/groups");
+    revalidatePath(`/groups/${groupId}`);
+    return { ok: true, groupId };
+  }
+
+  const { data: members } = await admin
+    .from("group_members")
+    .select("id, status")
+    .eq("group_id", groupId)
+    .neq("status", "declined");
+
+  const currentMembers = (members ?? []) as { id: string; status: string }[];
+  const maxPlayers = ((group as any).sports?.max_players ?? 20) as number;
+  if (currentMembers.length >= maxPlayers) return { error: "This group is already full" };
+
+  const insert = existing
+    ? await admin.from("group_members").update({ status: "confirmed" }).eq("group_id", groupId).eq("user_id", user.id)
+    : await admin.from("group_members").insert({ group_id: groupId, user_id: user.id, status: "confirmed" });
+
+  if (insert.error) return { error: insert.error.message };
+
+  const confirmedCount = currentMembers.filter(member => member.status === "confirmed").length + (existing?.status === "pending" ? 0 : 1);
+  if (confirmedCount >= (((group as any).sports?.min_players ?? 2) as number)) {
+    await admin.from("groups").update({ status: "confirmed" }).eq("id", groupId);
+  }
+
+  revalidatePath("/groups");
+  revalidatePath(`/groups/${groupId}`);
+  revalidatePath("/home");
+  return { ok: true, groupId };
 }
 
 export async function invitePlayerToGroup(groupId: string, targetUserId: string) {

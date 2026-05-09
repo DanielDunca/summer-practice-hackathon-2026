@@ -3,7 +3,7 @@
 import { useState, useEffect, useRef } from "react";
 import { useRouter } from "next/navigation";
 import { createClient } from "@/lib/supabase/client";
-import { runMatching, respondToGroupInvite, type MatchResult } from "@/app/actions/match";
+import { createGroupFromPreview, joinExistingGroup, runMatching, type MatchResult } from "@/app/actions/match";
 import { toast } from "sonner";
 import { motion, AnimatePresence } from "framer-motion";
 import { Zap, CircleCheckBig, X, ArrowRight, Users, Clock, Loader2, ChevronRight, UserCircle2 } from "lucide-react";
@@ -89,22 +89,41 @@ export default function ShowUpToday({ userSports, today, existing }: Props) {
     await runMatchCheck();
   }
 
-  async function handlePreviewResponse(groupId: string, response: "confirmed" | "declined") {
-    const result = await respondToGroupInvite(groupId, response);
+  async function handleJoinPreview(group: MatchResult) {
+    if (group.groupId && group.currentUserStatus === "confirmed") {
+      router.push(`/groups/${group.groupId}`);
+      return;
+    }
+
+    if (group.groupId) {
+      const result = await joinExistingGroup(group.groupId);
+      if (result?.error) {
+        toast.error(result.error);
+        return;
+      }
+      toast.success("You joined the group");
+      router.push(`/groups/${group.groupId}`);
+      router.refresh();
+      return;
+    }
+
+    const memberIds = group.members.map(member => member.userId);
+    const result = await createGroupFromPreview(group.sportId, memberIds);
     if (result?.error) {
       toast.error(result.error);
       return;
     }
 
-    setMatchedGroups(prev => {
-      if (response === "declined") {
-        return prev.filter(group => group.groupId !== groupId);
-      }
-      return prev.map(group => group.groupId === groupId ? { ...group, currentUserStatus: "confirmed" } : group);
-    });
+    toast.success("Group created");
+    if ("groupId" in result && result.groupId) {
+      router.push(`/groups/${result.groupId}`);
+      router.refresh();
+    }
+  }
 
-    toast.success(response === "confirmed" ? "You joined the group" : "Group declined");
-    router.refresh();
+  async function handleDeclinePreview(previewId: string) {
+    setMatchedGroups(prev => prev.filter(group => group.previewId !== previewId));
+    toast.success("Preview dismissed");
   }
 
   async function handleWithdraw() {
@@ -193,7 +212,7 @@ export default function ShowUpToday({ userSports, today, existing }: Props) {
               >
                 <p className="text-xs font-semibold text-zinc-400 uppercase tracking-wide">Your groups</p>
                 {matchedGroups.map(g => (
-                  <div key={g.groupId} className="rounded-2xl border border-zinc-200 bg-white overflow-hidden">
+                  <div key={g.previewId} className="rounded-2xl border border-zinc-200 bg-white overflow-hidden">
                     <div className="flex items-center gap-4 p-4 border-b border-zinc-100">
                       <span className="text-2xl">{g.sportIcon}</span>
                       <div className="flex-1 min-w-0">
@@ -227,7 +246,9 @@ export default function ShowUpToday({ userSports, today, existing }: Props) {
                               </div>
                             )}
                             <div className="min-w-0 flex-1">
-                              <p className="text-sm font-medium text-zinc-900 truncate">{member.fullName}</p>
+                              <p className="text-sm font-medium text-zinc-900 truncate">
+                                {member.fullName}{member.isCurrentUser ? " (you)" : ""}
+                              </p>
                               <p className="text-[10px] uppercase tracking-wide text-zinc-400">{member.status}</p>
                             </div>
                           </Link>
@@ -236,30 +257,21 @@ export default function ShowUpToday({ userSports, today, existing }: Props) {
                     </div>
 
                     <div className="p-4 flex items-center justify-between gap-3">
-                      {g.currentUserStatus === "confirmed" ? (
-                        <Link
-                          href={`/groups/${g.groupId}`}
+                      <div className="flex items-center gap-2">
+                        <button
+                          onClick={() => handleJoinPreview(g)}
                           className="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-zinc-900 text-white text-sm font-semibold hover:bg-zinc-800 transition-colors"
                         >
                           <ChevronRight className="w-4 h-4" />
-                          Enter group
-                        </Link>
-                      ) : (
-                        <div className="flex items-center gap-2">
-                          <button
-                            onClick={() => handlePreviewResponse(g.groupId, "confirmed")}
-                            className="px-4 py-2 rounded-xl bg-zinc-900 text-white text-sm font-semibold hover:bg-zinc-800 transition-colors"
-                          >
-                            Join group
-                          </button>
-                          <button
-                            onClick={() => handlePreviewResponse(g.groupId, "declined")}
-                            className="px-4 py-2 rounded-xl border border-zinc-200 text-zinc-500 text-sm font-semibold hover:bg-zinc-50 hover:text-zinc-900 transition-colors"
-                          >
-                            Decline
-                          </button>
-                        </div>
-                      )}
+                          {g.groupId ? (g.currentUserStatus === "confirmed" ? "Enter group" : "Join group") : "Create group"}
+                        </button>
+                        <button
+                          onClick={() => handleDeclinePreview(g.previewId)}
+                          className="px-4 py-2 rounded-xl border border-zinc-200 text-zinc-500 text-sm font-semibold hover:bg-zinc-50 hover:text-zinc-900 transition-colors"
+                        >
+                          Decline
+                        </button>
+                      </div>
                     </div>
                   </div>
                 ))}
