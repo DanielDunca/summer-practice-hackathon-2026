@@ -34,6 +34,7 @@ export default function ShowUpToday({ userSports, today, existing }: Props) {
   const [matching, setMatching] = useState(false);
   const [done, setDone] = useState(alreadyIn);
   const [matchedGroups, setMatchedGroups] = useState<MatchResult[]>([]);
+  const [joiningId, setJoiningId] = useState<string | null>(null);
   const autoChecked = useRef(false);
 
   useEffect(() => {
@@ -90,34 +91,35 @@ export default function ShowUpToday({ userSports, today, existing }: Props) {
   }
 
   async function handleJoinPreview(group: MatchResult) {
-    if (group.groupId && group.currentUserStatus === "confirmed") {
-      router.push(`/groups/${group.groupId}`);
-      return;
-    }
+    if (joiningId) return;
+    setJoiningId(group.previewId);
 
-    if (group.groupId) {
-      const result = await joinExistingGroup(group.groupId);
-      if (result?.error) {
-        toast.error(result.error);
+    try {
+      if (group.groupId && group.currentUserStatus === "confirmed") {
+        router.push(`/groups/${group.groupId}`);
         return;
       }
-      toast.success("You joined the group");
-      router.push(`/groups/${group.groupId}`);
-      router.refresh();
-      return;
-    }
 
-    const memberIds = group.members.map(member => member.userId);
-    const result = await createGroupFromPreview(group.sportId, memberIds);
-    if (result?.error) {
-      toast.error(result.error);
-      return;
-    }
+      if (group.groupId) {
+        const result = await joinExistingGroup(group.groupId);
+        if (result?.error) { toast.error(result.error); return; }
+        toast.success("You joined the group");
+        router.push(`/groups/${group.groupId}`);
+        router.refresh();
+        return;
+      }
 
-    toast.success("Group created");
-    if ("groupId" in result && result.groupId) {
-      router.push(`/groups/${result.groupId}`);
-      router.refresh();
+      const memberIds = group.members.map(member => member.userId);
+      const result = await createGroupFromPreview(group.sportId, memberIds);
+      if (result?.error) { toast.error(result.error); return; }
+
+      toast.success("Group created");
+      if ("groupId" in result && result.groupId) {
+        router.push(`/groups/${result.groupId}`);
+        router.refresh();
+      }
+    } finally {
+      setJoiningId(null);
     }
   }
 
@@ -260,9 +262,12 @@ export default function ShowUpToday({ userSports, today, existing }: Props) {
                       <div className="flex items-center gap-2">
                         <button
                           onClick={() => handleJoinPreview(g)}
-                          className="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-zinc-900 text-white text-sm font-semibold hover:bg-zinc-800 transition-colors"
+                          disabled={joiningId !== null}
+                          className="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-zinc-900 text-white text-sm font-semibold hover:bg-zinc-800 disabled:opacity-50 transition-colors"
                         >
-                          <ChevronRight className="w-4 h-4" />
+                          {joiningId === g.previewId
+                            ? <Loader2 className="w-4 h-4 animate-spin" />
+                            : <ChevronRight className="w-4 h-4" />}
                           {g.groupId ? (g.currentUserStatus === "confirmed" ? "Enter group" : "Join group") : "Create group"}
                         </button>
                         <button

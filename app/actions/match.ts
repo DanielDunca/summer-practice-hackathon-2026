@@ -207,6 +207,20 @@ export async function createGroupFromPreview(sportId: string, memberIds: string[
 }
 
 async function createGroupFromPreviewInternal(admin: ReturnType<typeof createAdminClient>, sportId: string, memberIds: string[], currentUserId: string, today: string) {
+  // Guard: if the user is already in a group for this sport today, return that group
+  const { data: existingMembership } = await admin
+    .from("group_members")
+    .select("group_id, groups!inner(id, sport_id, event_date, status)")
+    .eq("user_id", currentUserId)
+    .filter("groups.sport_id", "eq", sportId)
+    .filter("groups.event_date", "eq", today)
+    .neq("groups.status", "cancelled")
+    .maybeSingle();
+
+  if (existingMembership) {
+    return { groupId: (existingMembership as any).group_id };
+  }
+
   const { data: sport } = await admin
     .from("sports")
     .select("id, name, icon, min_players, max_players")
@@ -253,13 +267,14 @@ async function createGroupFromPreviewInternal(admin: ReturnType<typeof createAdm
   const memberNames = sorted.map(p => (p.full_name ?? "Player").split(" ")[0]).join(", ");
   const welcomeMsg = await generateText(
     `You are a friendly coordinator for ShowUp2Move, a sports matching app. A new ${(sport as any).name} group just formed with ${sorted.length} players: ${memberNames}. Write a short, energetic welcome message (2 sentences max) to kick off their group chat. Be warm and enthusiastic. No hashtags, no emoji spam — just natural energy.`
-  ) ?? `Welcome to the ${(sport as any).name} group, ${memberNames}. Use this chat to confirm time, place, and anything you need before you play.`;
+  ) || `Welcome to the ${(sport as any).name} group, ${memberNames}! Use this chat to confirm time, place, and anything you need before you play.`;
 
   await admin.from("messages").insert({
     group_id: (group as any).id,
     user_id: currentUserId,
     content: welcomeMsg,
-  });
+    is_system: true,
+  } as any);
 
   for (const memberId of memberIds) {
     await sendNotification(
@@ -613,7 +628,7 @@ export async function joinExistingGroup(groupId: string) {
 
   if (insert.error) return { error: insert.error.message };
 
-  const confirmedCount = currentMembers.filter(member => member.status === "confirmed").length + (existing?.status === "pending" ? 0 : 1);
+  const confirmedCount = currentMembers.filter(member => member.status === "confirmed").length + (existing?.status !== "confirmed" ? 1 : 0);
   if (confirmedCount >= (((group as any).sports?.min_players ?? 2) as number)) {
     await admin.from("groups").update({ status: "confirmed" }).eq("id", groupId);
   }
@@ -621,6 +636,7 @@ export async function joinExistingGroup(groupId: string) {
   revalidatePath("/groups");
   revalidatePath(`/groups/${groupId}`);
   revalidatePath("/home");
+  revalidatePath("/match");
   return { ok: true, groupId };
 }
 
